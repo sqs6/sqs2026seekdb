@@ -28,10 +28,11 @@ namespace oceanbase
 {
 namespace storage
 {
-int ObFTDictHub::init()
+int ObFTDictHub::init(ObIAllocator *alloc)
 {
-  static constexpr int K_MAX_DICT_BUCKET = 128; // for now, only built-in dicts.
   int ret = OB_SUCCESS;
+  static constexpr int K_MAX_DICT_BUCKET = 128; // for now, only built-in dicts.
+  alloc_ = alloc;
   if (OB_FAIL(dict_map_.create(K_MAX_DICT_BUCKET, "dict_map"))) {
   } else if (OB_FAIL(rw_dict_lock_.init(K_MAX_DICT_BUCKET))) {
   } else {
@@ -43,10 +44,43 @@ int ObFTDictHub::init()
 int ObFTDictHub::destroy()
 {
   int ret = OB_SUCCESS;
+  for (int i = 0; i < MAX_DICT_TYPE_NUM; ++i) {
+    if (OB_NOT_NULL(shared_dicts_[i])) {
+      destroy_shared_dict(shared_dicts_[i]);
+      shared_dicts_[i] = nullptr;
+    }
+  }
   is_inited_ = false;
   return ret;
 }
+
+void ObFTDictHub::destroy_shared_dict(ObFTSharedDict *shared)
+{
+  if (OB_ISNULL(shared) || OB_ISNULL(alloc_)) {
+    return;
+  }
+  if (OB_NOT_NULL(shared->dict_)) {
+    shared->dict_->~ObFTRangeDict();
+    alloc_->free(shared->dict_);
+    shared->dict_ = nullptr;
+  }
+  if (OB_NOT_NULL(shared->container_)) {
+    OB_DELETEx(ObFTCacheRangeContainer, alloc_, shared->container_);
+    shared->container_ = nullptr;
+  }
+  OB_DELETEx(ObFTSharedDict, alloc_, shared);
+}
+
 int ObFTDictHub::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container)
+{
+  int ret = OB_SUCCESS;
+  ObFTDictInfoKey key(static_cast<uint64_t>(desc.type_));
+  ObBucketHashWLockGuard guard(rw_dict_lock_, key.hash());
+  ret = build_cache_locked(desc, container);
+  return ret;
+}
+
+int ObFTDictHub::build_cache_locked(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container)
 {
   int ret = OB_SUCCESS;
   ObFTDictInfoKey key(static_cast<uint64_t>(desc.type_));
@@ -56,8 +90,6 @@ int ObFTDictHub::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &
   if (!is_inited_) {
     ret = OB_NOT_INIT;
   } else {
-    ObBucketHashWLockGuard guard(rw_dict_lock_, key.hash());
-
     // try if valid with no recursive lock
     if (OB_FAIL(get_dict_info(key, info))) {
       if (OB_HASH_NOT_EXIST == ret) {
@@ -78,6 +110,71 @@ int ObFTDictHub::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &
         } else if (OB_FAIL(put_dict_info(key, info))) {
         }
       }
+    }
+  }
+  return ret;
+}
+
+int ObFTDictHub::build_shared_dict(const ObFTDictDesc &desc, ObFTSharedDict *&shared)
+{
+  int ret = OB_SUCCESS;
+  shared = nullptr;
+  ObFTCacheRangeContainer *container = nullptr;
+  ObFTRangeDict *range_dict = nullptr;
+  ObFTSharedDict *entry = nullptr;
+
+  if (OB_ISNULL(alloc_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_ISNULL(container = OB_NEWx(ObFTCacheRangeContainer, alloc_, *alloc_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(build_cache_locked(desc, *container))) {
+    OB_DELETEx(ObFTCacheRangeContainer, alloc_, container);
+    container = nullptr;
+  } else if (OB_ISNULL(range_dict = OB_NEWx(ObFTRangeDict, alloc_, *alloc_, container, desc))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    OB_DELETEx(ObFTCacheRangeContainer, alloc_, container);
+    container = nullptr;
+  } else if (OB_FAIL(range_dict->init())) {
+    range_dict->~ObFTRangeDict();
+    alloc_->free(range_dict);
+    OB_DELETEx(ObFTCacheRangeContainer, alloc_, container);
+    container = nullptr;
+  } else if (OB_ISNULL(entry = OB_NEWx(ObFTSharedDict, alloc_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    range_dict->~ObFTRangeDict();
+    alloc_->free(range_dict);
+    OB_DELETEx(ObFTCacheRangeContainer, alloc_, container);
+    container = nullptr;
+  } else {
+    entry->container_ = container;
+    entry->dict_ = range_dict;
+    shared = entry;
+  }
+  return ret;
+}
+
+int ObFTDictHub::get_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
+{
+  int ret = OB_SUCCESS;
+  dict = nullptr;
+  const uint32_t type_idx = static_cast<uint32_t>(desc.type_);
+  if (!is_inited_ || OB_ISNULL(alloc_)) {
+    ret = OB_NOT_INIT;
+  } else if (type_idx >= static_cast<uint32_t>(MAX_DICT_TYPE_NUM)) {
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    ObFTDictInfoKey key(static_cast<uint64_t>(desc.type_));
+    // 构建只发生一次，这里持写锁串行化，避免重复构建。
+    ObBucketHashWLockGuard guard(rw_dict_lock_, key.hash());
+    ObFTSharedDict *shared = shared_dicts_[type_idx];
+    if (OB_ISNULL(shared)) {
+      if (OB_FAIL(build_shared_dict(desc, shared))) {
+      } else {
+        shared_dicts_[type_idx] = shared;
+      }
+    }
+    if (OB_SUCC(ret) && OB_NOT_NULL(shared)) {
+      dict = shared->dict_;
     }
   }
   return ret;

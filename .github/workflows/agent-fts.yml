@@ -1,0 +1,171 @@
+name: Agent FTS Optimization
+
+on:
+  push:
+    branches: [ "feature/fts-optimization" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    name: compile
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - name: Free Disk Space
+        uses: insightsengineering/disk-space-reclaimer@v1
+        with:
+          tools-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+          docker-images: true
+
+      - uses: actions/checkout@v4
+
+      - name: Install ubuntu environment
+        shell: bash
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y git wget rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5 python3 default-mysql-client
+
+      - name: Cache deps
+        id: cache-deps
+        uses: actions/cache@v3
+        env:
+          cache-name: cache-deps
+        with:
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-el9.x86_64-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
+          path: deps/3rd
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Build release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f ~/.bashrc ]]; then
+            source ~/.bashrc
+          fi
+          ./build.sh release --init
+          echo "$GITHUB_WORKSPACE/deps/3rd/usr/local/oceanbase/devtools/bin" >> "$GITHUB_PATH"
+          cd build_release
+          make -j4
+          test -x src/observer/seekdb
+
+      - name: Pack seekdb runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime
+          cp build_release/src/observer/seekdb runtime/seekdb
+          cp deps/3rd/u01/obclient/bin/obclient runtime/obclient
+          cp deps/3rd/u01/obclient/bin/mysqltest runtime/mysqltest
+          tar -czf seekdb-runtime.tar.gz -C runtime .
+
+      - name: Upload seekdb runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: seekdb-runtime
+          path: seekdb-runtime.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+  benchmark:
+    name: fts-large-benchmark
+    needs: compile
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ubuntu environment
+        shell: bash
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y python3 default-mysql-client
+
+      - name: Download seekdb runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: seekdb-runtime
+          path: runtime_tar
+
+      - name: Unpack seekdb runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime
+          tar -xzf runtime_tar/seekdb-runtime.tar.gz -C runtime
+          chmod +x runtime/seekdb runtime/obclient runtime/mysqltest
+          ls -la runtime
+
+      - name: Run FTS large benchmark and score it
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/script/seekdb/agent_run_bench.py \
+            --seekdb "$GITHUB_WORKSPACE/runtime/seekdb" \
+            --obclient "$GITHUB_WORKSPACE/runtime/obclient" \
+            --work-dir "$GITHUB_WORKSPACE/agent_bench" \
+            --label "${{ github.sha }}" \
+            | tee "$GITHUB_WORKSPACE/bench_score.txt"
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fts-benchmark-report
+          path: |
+            agent_bench/bench_report.txt
+            bench_score.txt
+          retention-days: 7
+          if-no-files-found: warn
+
+  mysqltest:
+    name: mysqltest-fts-index
+    needs: compile
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ubuntu environment
+        shell: bash
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y python3
+
+      - name: Download seekdb runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: seekdb-runtime
+          path: runtime_tar
+
+      - name: Unpack seekdb runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime
+          tar -xzf runtime_tar/seekdb-runtime.tar.gz -C runtime
+          chmod +x runtime/seekdb runtime/obclient runtime/mysqltest
+
+      - name: Run fts_index mysqltest cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/script/seekdb/agent_run_cases.py \
+            --seekdb "$GITHUB_WORKSPACE/runtime/seekdb" \
+            --obclient "$GITHUB_WORKSPACE/runtime/obclient" \
+            --mysqltest "$GITHUB_WORKSPACE/runtime/mysqltest" \
+            --work-dir "$GITHUB_WORKSPACE/agent_work" \
+            --port 2881 \
+            --case-prefix "fts_index."

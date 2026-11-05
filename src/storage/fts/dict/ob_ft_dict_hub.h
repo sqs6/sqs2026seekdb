@@ -17,8 +17,10 @@
 #ifndef _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 #define _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 
+#include "lib/allocator/ob_allocator.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/lock/ob_bucket_lock.h"
+#include "storage/fts/dict/ob_ft_dict.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
 
 namespace oceanbase
@@ -93,13 +95,37 @@ private:
 };
 
 class ObFTCacheRangeContainer;
+class ObFTRangeDict;
+
 class ObFTDictHub
 {
 public:
-  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_() {}
+  /**
+   * @struct ObFTSharedDict
+   * @brief 进程内共享的区间词典。
+   * @note container_ 持有 kv-cache handle（保证 DAT block 不会被回收），
+   *       dict_ 引用 container_ 中的 DAT，二者必须同生共死。
+   */
+  struct ObFTSharedDict
+  {
+    ObFTSharedDict() : container_(nullptr), dict_(nullptr) {}
+    ObFTCacheRangeContainer *container_;
+    ObFTRangeDict *dict_;
+  };
+
+  // ObFTDictType 的取值个数
+  static constexpr int MAX_DICT_TYPE_NUM = 4;
+
+public:
+  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_(), alloc_(nullptr)
+  {
+    for (int i = 0; i < MAX_DICT_TYPE_NUM; ++i) {
+      shared_dicts_[i] = nullptr;
+    }
+  }
   ~ObFTDictHub() {}
 
-  int init();
+  int init(ObIAllocator *alloc);
 
   int destroy();
 
@@ -107,17 +133,35 @@ public:
 
   int load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
 
+  /**
+   * @brief 获取进程内共享的区间词典。
+   * @note 返回的词典由 hub 持有，调用方只读借用，不得释放。
+   *       词典内部只读（DAT block 由 kv-cache 固定），可被多线程并发使用。
+   */
+  int get_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict);
+
 private:
   int get_dict_info(const ObFTDictInfoKey &key, ObFTDictInfo &info);
 
   int put_dict_info(const ObFTDictInfoKey &key, const ObFTDictInfo &info);
 
+  // 调用前需持有 rw_dict_lock_ 的写锁
+  int build_cache_locked(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
+
+  // 调用前需持有 rw_dict_lock_ 的写锁
+  int build_shared_dict(const ObFTDictDesc &desc, ObFTSharedDict *&shared);
+
+  void destroy_shared_dict(ObFTSharedDict *shared);
 
 private:
   bool is_inited_;
   // holds info of dict
   hash::ObHashMap<ObFTDictInfoKey, ObFTDictInfo> dict_map_;
   ObBucketLock rw_dict_lock_;
+  // 用于构建共享词典
+  ObIAllocator *alloc_;
+  // 按 ObFTDictType 下标索引的共享词典
+  ObFTSharedDict *shared_dicts_[MAX_DICT_TYPE_NUM];
 };
 
 } //  namespace storage
