@@ -16,7 +16,7 @@
 
 #define USING_LOG_PREFIX STORAGE_FTS
 
-#include "storage/fts/ob_ik_ft_parser.h"
+#include "src/storage/fts/ob_ik_ft_parser.h"
 
 #include "lib/charset/ob_charset.h"
 #include "lib/ob_errno.h"
@@ -231,11 +231,13 @@ int ObIKFTParserDesc::get_add_word_flag(ObAddWordFlag &flag) const
 int ObIKFTParser::init_dict(const ObFTParserParam &param)
 {
   int ret = OB_SUCCESS;
+  ObIFTDict *tmp_dict = nullptr;
 
   if (OB_ISNULL(hub_)) {
     ret = OB_ERR_UNEXPECTED;
   }
 
+  ObFTRangeDict *dict = nullptr;
   ObFTDictDesc main_dict_desc("main_dict",
                               ObFTDictType::DICT_IK_MAIN,
                               ObCharsetType::CHARSET_UTF8MB4,
@@ -256,7 +258,7 @@ int ObIKFTParser::init_dict(const ObFTParserParam &param)
       // clear dict cache, always false now
     } else {
       // 词典区间表在进程内共享复用：原来每次分词都要把每个 range 重新从 kv-cache 取一遍，
-      // 再逐 range 重建 ObFTCacheDict，这里改成只构建一次、之后直接借用。
+      // 再逐 range 重建 ObFTCacheDict；这里改成只构建一次、之后直接借用。
       // 词典内容只读，共享后分词结果与原来完全一致。
       if (OB_FAIL(hub_->get_shared_dict(main_dict_desc, dict_main_))) {
       } else if (OB_FAIL(hub_->get_shared_dict(quan_dict_desc, dict_quan_))) {
@@ -326,7 +328,7 @@ int ObIKFTParser::init_segmenter(const ObFTParserParam &param)
     OB_DELETEx(ObIKLetterProcessor, &allocator_, letter_seg);
     OB_DELETEx(ObIKQuantifierProcessor, &allocator_, cnqsg);
     OB_DELETEx(ObIKCJKProcessor, &allocator_, cjksg);
-    OB_DELETex(ObIKSurrogateProcessor, &allocator_, surrogate_seg);
+    OB_DELETEx(ObIKSurrogateProcessor, &allocator_, surrogate_seg);
   }
   return ret;
 }
@@ -336,7 +338,6 @@ void ObIKFTParser::reset()
   if (!OB_ISNULL(ctx_)) {
     ctx_->~TokenizeContext();
     allocator_.free(ctx_);
-    ctx_ = nullptr;
   }
 
   for (ObIIKProcessor *segmenter : segmenters_) {

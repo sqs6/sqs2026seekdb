@@ -136,7 +136,7 @@ public:
   /**
    * @brief 获取进程内共享的区间词典。
    * @note 返回的词典由 hub 持有，调用方只读借用，不得释放。
-   *       词典内部只读（DAT block 由 kv-cache 固定），可被多线程并发使用。
+   *       词典内容只读（DAT block 由 kv-cache 固定），可被多线程并发使用。
    */
   int get_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict);
 

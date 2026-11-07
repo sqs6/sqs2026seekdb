@@ -70,7 +70,6 @@ void ObFTDictHub::destroy_shared_dict(ObFTSharedDict *shared)
   }
   OB_DELETEx(ObFTSharedDict, alloc_, shared);
 }
-
 int ObFTDictHub::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container)
 {
   int ret = OB_SUCCESS;
@@ -164,7 +163,7 @@ int ObFTDictHub::get_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
     ret = OB_NOT_SUPPORTED;
   } else {
     ObFTDictInfoKey key(static_cast<uint64_t>(desc.type_));
-    // 构建只发生一次，这里持写锁串行化，避免重复构建。
+    // 共享词典只构建一次，这里持写锁串行化，避免重复构建。
     ObBucketHashWLockGuard guard(rw_dict_lock_, key.hash());
     ObFTSharedDict *shared = shared_dicts_[type_idx];
     if (OB_ISNULL(shared)) {

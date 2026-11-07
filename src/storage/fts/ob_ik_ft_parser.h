@@ -90,7 +90,7 @@ private:
   ObList<ObIIKProcessor *, ObIAllocator> segmenters_;
 
   // 词典由 ObFTDictHub 在进程内共享持有，这里只借用，不负责释放。
-  // 词典内部只读，可被多线程并发使用。
+  // 词典内容只读，可被多线程并发使用。
   ObIFTDict *dict_main_;
   ObIFTDict *dict_quan_;
   ObIFTDict *dict_stop_;
@@ -111,4 +111,4 @@ public:
 } //  namespace storage
 } //  namespace oceanbase
 
-#endif //  _OCEANBASE_STORAGE_FTS_OB_IK_FT_PARSER_H_
+#endif // _OCEANBASE_STORAGE_FTS_OB_IK_FT_PARSER_H_
