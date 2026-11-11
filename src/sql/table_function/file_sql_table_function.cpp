@@ -110,9 +110,8 @@ bool is_datetime(const ObString &s)
   if (sep != ' ' && sep != 'T') { return false; }
   for (int64_t i = 11; i < 19; ++i) {
     const char c = s.ptr()[i];
-    if (i == 14) {
-      if (c != ':') { return false; }
-    } else if (i == 17) {
+    // 时间部分从第 11 位开始：HH:MM:SS，两个冒号分别在第 13 位和第 16 位
+    if (i == 13 || i == 16) {
       if (c != ':') { return false; }
     } else if (!isdigit(static_cast<unsigned char>(c))) {
       return false;
@@ -309,8 +308,13 @@ int parse_jsonl_line(const ObString &line, ObIAllocator &allocator,
       }
     }
     if (OB_SUCC(ret)) {
-      if (OB_FAIL(keys.push_back(ObString(key.length(), key.c_str())))) { ret = OB_ERR_UNEXPECTED; }
-      else if (OB_FAIL(values.push_back(value))) { ret = OB_ERR_UNEXPECTED; }
+      // key 是函数内的局部字符串，必须复制到分配器里才能在函数返回后继续使用
+      ObString key_str;
+      if (OB_FAIL(copy_string(allocator, ObString(key.length(), key.c_str()), key_str))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(keys.push_back(key_str))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(values.push_back(value))) { ret = OB_ERR_UNEXPECTED; }
       else if (OB_FAIL(nulls.push_back(is_null))) { ret = OB_ERR_UNEXPECTED; }
     }
     if (OB_SUCC(ret)) {
@@ -339,35 +343,81 @@ int read_whole_file(const ObString &path, ObIAllocator &allocator, ObString &con
   return ret;
 }
 
-// 拆分行（保留引号内的换行）
+// 把一条记录放进结果里，纯空白记录忽略
+int push_record(const ObString &record, ObArray<ObString> &lines)
+{
+  int ret = OB_SUCCESS;
+  bool blank = true;
+  for (int64_t k = 0; k < record.length(); ++k) {
+    if (!is_space(record.ptr()[k])) { blank = false; break; }
+  }
+  if (!blank && OB_FAIL(lines.push_back(record))) { ret = OB_ERR_UNEXPECTED; }
+  return ret;
+}
+
+// 按换行拆分文本。JSONL 每行一个 JSON 对象，字符串里不会出现裸换行，
+// 所以这里不做引号处理，避免 JSON 的转义引号把记录边界算错。
 int split_lines(const ObString &content, ObArray<ObString> &lines)
 {
   int ret = OB_SUCCESS;
   const char *data = content.ptr();
   const int64_t len = content.length();
   int64_t start = 0;
-  bool in_quotes = false;
-  for (int64_t i = 0; i <= len; ++i) {
-    if (i < len) {
-      const char c = data[i];
-      if (c == '"') {
-        if (in_quotes && i + 1 < len && data[i + 1] == '"') { ++i; continue; }
-        in_quotes = !in_quotes;
-        continue;
-      }
-      if (c != '\n') { continue; }
-    }
+  for (int64_t i = 0; i < len; ++i) {
+    if (data[i] != '\n') { continue; }
     int64_t end = i;
     if (end > start && data[end - 1] == '\r') { --end; }
-    if (end > start || i < len) {
-      ObString line(end - start, data + start);
-      bool blank = true;
-      for (int64_t k = 0; k < line.length(); ++k) {
-        if (!is_space(line.ptr()[k])) { blank = false; break; }
-      }
-      if (!blank && OB_FAIL(lines.push_back(line))) { ret = OB_ERR_UNEXPECTED; break; }
-    }
+    if (OB_FAIL(push_record(ObString(end - start, data + start), lines))) { return ret; }
     start = i + 1;
+  }
+  if (start < len) {
+    if (OB_FAIL(push_record(ObString(len - start, data + start), lines))) { return ret; }
+  }
+  return ret;
+}
+
+// 按 CSV 记录拆分：引号里的换行属于字段内容，不能当成记录分隔符。
+// 只有位于字段起始（上一个逗号之后）的双引号才会开启引号字段，
+// 与 parse_csv_line 的取字段规则保持一致。
+int split_csv_records(const ObString &content, ObArray<ObString> &lines)
+{
+  int ret = OB_SUCCESS;
+  const char *data = content.ptr();
+  const int64_t len = content.length();
+  int64_t start = 0;
+  bool in_quotes = false;
+  bool field_start = true;
+  int64_t i = 0;
+  while (i < len) {
+    const char c = data[i];
+    if (in_quotes) {
+      if (c == '"') {
+        // "" 表示一个引号
+        if (i + 1 < len && data[i + 1] == '"') { i += 2; continue; }
+        in_quotes = false;
+        ++i;
+        continue;
+      }
+      ++i;
+      continue;
+    }
+    if (c == '\n') {
+      int64_t end = i;
+      if (end > start && data[end - 1] == '\r') { --end; }
+      if (OB_FAIL(push_record(ObString(end - start, data + start), lines))) { return ret; }
+      start = i + 1;
+      field_start = true;
+      ++i;
+      continue;
+    }
+    if (c == ' ' || c == '\t' || c == '\r') { ++i; continue; }
+    if (c == ',') { field_start = true; ++i; continue; }
+    if (c == '"' && field_start) { in_quotes = true; field_start = false; ++i; continue; }
+    field_start = false;
+    ++i;
+  }
+  if (start < len) {
+    if (OB_FAIL(push_record(ObString(len - start, data + start), lines))) { return ret; }
   }
   return ret;
 }
@@ -560,31 +610,35 @@ int file_sql_load(const ObString &path, FileSqlFormat format, bool sample_only,
     }
   } else if (format == FILE_SQL_FORMAT_CSV) {
     ObArray<ObString> lines;
-    if (OB_FAIL(split_lines(content, lines)) || lines.count() == 0) {
+    if (OB_FAIL(split_csv_records(content, lines)) || lines.count() == 0) {
       ret = OB_ERR_UNEXPECTED;
     } else {
       ObArray<ObString> header;
       if (OB_FAIL(parse_csv_line(lines.at(0), allocator, header))) {
         ret = OB_ERR_UNEXPECTED;
       } else {
-        // 列名去重：重复列名追加 _2, _3 ...
+        // 列名去重：重复列名追加 __2、__3 ...
         for (int64_t i = 0; i < header.count(); ++i) {
           ObString name = header.at(i);
           int64_t dup = 1;
-          bool renamed = false;
           while (true) {
             bool conflict = false;
             for (int64_t j = 0; j < table.columns_.count(); ++j) {
-              if (0 == strcasecmp(table.columns_.at(j).name_.ptr(), name.ptr())) { conflict = true; break; }
+              if (0 == table.columns_.at(j).name_.case_compare(name)) { conflict = true; break; }
             }
             if (!conflict) { break; }
             ++dup;
             char buf[64];
-            const int64_t len = snprintf(buf, sizeof(buf), "%.*s_%ld", name.length(), name.ptr(), dup);
-            name = ObString(len, buf);
-            renamed = true;
+            const int64_t len = snprintf(buf, sizeof(buf), "%.*s__%ld", name.length(), name.ptr(), dup);
+            // 重命名后的列名要复制到分配器里，buf 是栈上的临时空间
+            ObString renamed;
+            if (OB_FAIL(copy_string(allocator, ObString(len, buf), renamed))) {
+              ret = OB_ERR_UNEXPECTED;
+              break;
+            }
+            name = renamed;
           }
-          (void)renamed;
+          if (OB_FAIL(ret)) { break; }
           FileSqlColumn column;
           column.name_ = name;
           column.nullable_ = true;
@@ -596,6 +650,7 @@ int file_sql_load(const ObString &path, FileSqlFormat format, bool sample_only,
             ObArray<ObString> values;
             if (OB_FAIL(parse_csv_line(lines.at(r), allocator, values))) {
               ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("file sql: failed to parse csv record", K(ret), K(r));
               break;
             }
             FileSqlRow row;

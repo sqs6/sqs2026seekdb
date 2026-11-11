@@ -3615,6 +3615,7 @@ int ObDMLResolver::bind_file_sql_table_function(const TableFunctionCall &call, T
   ObString path;
   ObString format_name;
   int64_t sample_size = -1;
+  char err_buf[MAX_PATH_SIZE];
   if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
   } else if (!enabled) {
     ret = OB_NOT_SUPPORTED;
@@ -3628,7 +3629,6 @@ int ObDMLResolver::bind_file_sql_table_function(const TableFunctionCall &call, T
       LOG_USER_ERROR(OB_ERR_UNEXPECTED, "file sql: path argument is not a string literal");
     } else {
       path.assign_ptr(path_node->str_value_, path_node->str_len_);
-      LOG_USER_ERROR(OB_SUCCESS, "file sql: path argument type is %d", path_node->type_);
     }
     for (int64_t i = 1; OB_SUCC(ret) && i < call.arguments_->num_child_; ++i) {
       const ParseNode *arg = call.arguments_->children_[i];
@@ -3676,11 +3676,16 @@ int ObDMLResolver::bind_file_sql_table_function(const TableFunctionCall &call, T
       }
     }
     if (OB_SUCC(ret) && OB_FAIL(file_sql_parse_format(format_name, format))) {
-      LOG_USER_ERROR(OB_ERR_UNEXPECTED, "file sql: invalid format");
+      // 格式不支持时按 SQL 语法错误返回，调用方才能拿到 1064
+      ret = OB_ERR_PARSE_SQL;
+      LOG_USER_ERROR(OB_ERR_PARSE_SQL, "unsupported file format",
+                     format_name.length(), format_name.ptr(), 1);
     } else if (OB_SUCC(ret)) {
       FileSqlTable table;
       if (OB_FAIL(file_sql_load(path, format, true, *allocator_, table))) {
-        LOG_USER_ERROR(OB_ERR_UNEXPECTED, "file sql: failed to load %s", path.ptr());
+        ret = OB_ERR_UNEXPECTED;
+        snprintf(err_buf, sizeof(err_buf), "file sql: failed to load %.*s", path.length(), path.ptr());
+        LOG_USER_ERROR(OB_ERR_UNEXPECTED, err_buf);
       } else {
         if (OB_FAIL(create_function_scan_item(call, item))) {
           LOG_USER_ERROR(OB_ERR_UNEXPECTED, "file sql: failed to create the scan item");
